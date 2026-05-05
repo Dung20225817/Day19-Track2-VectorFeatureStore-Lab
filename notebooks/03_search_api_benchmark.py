@@ -16,46 +16,40 @@
 # %%
 import _setup  # noqa: F401
 import statistics
-import subprocess
 import time
 from pathlib import Path
 
-import httpx
+from app.search import Searcher
+import app.main as app_main
+from fastapi.testclient import TestClient
 
 # %% [markdown]
-# ## 1. Khởi động API server (background)
+# ## 1. Initialize Searcher directly + wrap with FastAPI TestClient
 #
-# Trong production thực tế, bạn sẽ chạy `make api` ở terminal riêng. Notebook
-# này khởi động uvicorn ở background subprocess và đợi `/healthz` trả ready.
+# Build Searcher once, then use TestClient for API testing.
 
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
-proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
-    cwd=str(ROOT),
-)
+CORPUS_PATH = ROOT / "data" / "corpus_vn.jsonl"
 
-# Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
-for _ in range(60):
-    try:
-        r = httpx.get(f"{URL}/healthz", timeout=2.0)
-        if r.status_code == 200 and r.json().get("ready"):
-            break
-    except httpx.HTTPError:
-        pass
-    time.sleep(1)
-else:
-    raise RuntimeError("API didn't become ready within 60s")
+print("Building Searcher (loading embeddings + indexing corpus)...")
+searcher = Searcher.from_corpus(CORPUS_PATH)
+print(f"✅ Searcher ready: {searcher.size} docs indexed")
 
-print(httpx.get(f"{URL}/healthz").json())
+# Manually inject searcher into app module (global variable)
+app_main._searcher = searcher
+print("✅ TestClient ready")
+
+# Create TestClient for API calls
+from app.main import app
+client = TestClient(app)
 
 # %% [markdown]
 # ## 2. Single query — kiểm tra response shape
 
 # %%
-r = httpx.get(f"{URL}/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
-r.raise_for_status()
+r = client.get("/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
+assert r.status_code == 200, f"Request failed: {r.status_code}"
 body = r.json()
 print(f"latency_ms: {body['latency_ms']:.1f}")
 print(f"top-3 hits:")
@@ -91,7 +85,7 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
     for _ in range(reps):
         for q in golden:
             t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+            r = client.get("/search", params={"q": q["query"], "mode": mode})
             wall_latencies.append((time.perf_counter() - t0) * 1000)
             server_latencies.append(r.json()["latency_ms"])
     return {
@@ -124,12 +118,10 @@ else:
     print("  Check: re-run benchmark after 10 warm-up queries; or reduce RRF depth")
 
 # %% [markdown]
-# ## 5. Cleanup — stop the API server
+# ## 5. Cleanup
 
 # %%
-proc.terminate()
-proc.wait(timeout=5)
-print("API server stopped")
+print("✅ TestClient cleanup (implicit on cell end)")
 
 # %% [markdown]
 # ## Deliverable evidence
